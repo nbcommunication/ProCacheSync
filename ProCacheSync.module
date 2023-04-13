@@ -21,7 +21,7 @@ class ProCacheSync extends WireData implements Module {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProCache Sync',
-			'version' => 001,
+			'version' => 002,
 			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/ProCacheSync',
@@ -33,6 +33,7 @@ class ProCacheSync extends WireData implements Module {
 	}
 
 	const DB_TABLE = 'procache_sync';
+	const DELIMITER = '||';
 
 	/**
 	 * Cleared page IDs
@@ -70,7 +71,7 @@ class ProCacheSync extends WireData implements Module {
 			$this->update = false;
 
 			foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-				foreach(explode(',', $row['data']) as $id) {
+				foreach(explode(self::DELIMITER, $row['data']) as $id) {
 					$id = (int) $id;
 					if($id) {
 						$page = $this->wire()->pages->get($id);
@@ -97,26 +98,31 @@ class ProCacheSync extends WireData implements Module {
 	 */
 	public function ready() {
 
-		// Clear the cache if A, C or F
+		// If cache clear behaviour is A, C or F
 		$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
 			$cleared = $event->return;
 			if(($cleared['children'] ?? 0) + ($cleared['family'] ?? 0)) {
-				$this->add($event);
+				$this->addId($event->arguments('page')->id);
 			} else if($cleared['site'] ?? 0) {
-				$this->add();
+				$this->addId();
 			}
 		});
 
 		// All hook
-		$this->addHook('ProCache::clearAll', $this, 'add');
+		$this->addHook('ProCache::clearAll', function(HookEvent $event) {
+			$this->addId();
+		});
 
 		// Page hook
-		$this->addHook('ProCacheStaticClear::clearedPage', $this, 'add');
+		$this->addHook('ProCacheStaticClear::clearedPage', function(HookEvent $event) {
+			$this->addId($event->arguments('page')->id);
+		});
 
 		// When finished, updated the database if the cache cleared
 		$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
-			if($this->ids && substr($this->ids, -1) === ',') {
-				$data = array_unique(explode(',', trim($this->ids, ',')));
+			$delimiter = self::DELIMITER;
+			if($this->ids && substr($this->ids, strlen($delimiter) * -1) === $delimiter) {
+				$data = array_unique(explode($delimiter, trim($this->ids, $delimiter)));
 				if($this->update && count($data)) {
 					$query = $this->wire()->database->prepare(
 						'INSERT INTO ' . self::DB_TABLE .
@@ -124,7 +130,7 @@ class ProCacheSync extends WireData implements Module {
 							'ts=NOW(), ' .
 							'data=:data'
 					);
-					$query->bindValue(':data', implode(',', $data));
+					$query->bindValue(':data', implode($delimiter, $data));
 					$query->execute();
 					touch($this->syncFile());
 				}
@@ -135,14 +141,11 @@ class ProCacheSync extends WireData implements Module {
 	/**
 	 * Add id
 	 *
-	 * @param HookEvent|int $id
+	 * @param int $id
 	 *
 	 */
-	protected function add($id = 0) {
-		if($id instanceof HookEvent) {
-			$id = $id->arguments('page')->id;
-		}
-		$this->ids .= "$id,";
+	protected function addId($id = 0) {
+		$this->ids .= $id . self::DELIMITER;
 	}
 
 	/**
