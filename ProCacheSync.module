@@ -1,1 +1,186 @@
+<?php namespace ProcessWire;
 
+/**
+ * ProCache Sync
+ *
+ * #pw-summary Synchronises ProCache clearing across a multi-instance environment.
+ *
+ * @copyright 2023 NB Communication Ltd
+ * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
+ *
+ */
+
+class ProCacheSync extends WireData implements Module {
+
+	/**
+	 * getModuleInfo is a module required by all modules to tell ProcessWire about them
+	 *
+	 * @return array
+	 *
+	 */
+	public static function getModuleInfo() {
+		return [
+			'title' => 'ProCache Sync',
+			'version' => 001,
+			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
+			'author' => 'nbcommunication',
+			'href' => 'https://github.com/nbcommunication/ProCacheSync',
+			'singular' => true,
+			'autoload' => true,
+			'icon' => 'refresh',
+			'requires' => 'ProcessWire>=3.0.210,PHP>=8.1.0,ProCache>=4.0.3,LazyCron',
+		];
+	}
+
+	const DB_TABLE = 'procache_sync';
+
+	/**
+	 * Cleared page IDs
+	 *
+	 * @var array
+	 *
+	 */
+	protected $ids = '';
+
+	/**
+	 * Should the database be updated?
+	 *
+	 * @var array
+	 *
+	 */
+	protected $update = true;
+
+	/**
+	 * Initialize the module
+	 *
+	 */
+	public function init() {
+
+		// Sync every minute
+		$this->addHook('LazyCron::every30Seconds', function(HookEvent $event) {
+
+			$procache = $this->wire()->procache;
+
+			$syncFile = $this->syncFile();
+
+			$query = $this->wire()->database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
+			$query->bindValue(':now', date('Y-m-d H:i:s', filemtime($syncFile) ?: 0));
+			$query->execute();
+
+			$this->update = false;
+
+			foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+				foreach(explode(',', $row['data']) as $id) {
+					$id = (int) $id;
+					if($id) {
+						$page = $this->wire()->pages->get($id);
+						if($page->id) {
+							$procache->getStatic()->executeCacheClearBehaviors($page);
+						}
+					} else {
+						$procache->clearAll();
+						break 2;
+					}
+				}
+			}
+
+			touch($syncFile);
+
+			$event->replace = true;
+			$event->return = '';
+		});
+	}
+
+	/**
+	 * When ready
+	 *
+	 */
+	public function ready() {
+
+		// Clear the cache if A, C or F
+		$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
+			$cleared = $event->return;
+			if(($cleared['children'] ?? 0) + ($cleared['family'] ?? 0)) {
+				$this->add($event);
+			} else if($cleared['site'] ?? 0) {
+				$this->add();
+			}
+		});
+
+		// All hook
+		$this->addHook('ProCache::clearAll', $this, 'add');
+
+		// Page hook
+		$this->addHook('ProCacheStaticClear::clearedPage', $this, 'add');
+
+		// When finished, updated the database if the cache cleared
+		$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
+			if($this->ids && substr($this->ids, -1) === ',') {
+				$data = array_unique(explode(',', trim($this->ids, ',')));
+				if($this->update && count($data)) {
+					$query = $this->wire()->database->prepare(
+						'INSERT INTO ' . self::DB_TABLE .
+						' SET ' .
+							'ts=NOW(), ' .
+							'data=:data'
+					);
+					$query->bindValue(':data', implode(',', $data));
+					$query->execute();
+					touch($this->syncFile());
+				}
+			}
+		});
+	}
+
+	/**
+	 * Add id
+	 *
+	 * @param HookEvent|int $id
+	 *
+	 */
+	protected function add($id = 0) {
+		if($id instanceof HookEvent) {
+			$id = $id->arguments('page')->id;
+		}
+		$this->ids .= "$id,";
+	}
+
+	/**
+	 * Get the sync file path
+	 *
+	 * Create the sync file if it does not exist
+	 *
+	 * @return string
+	 *
+	 */
+	protected function syncFile() {
+		$syncFile = $this->wire()->procache->getStatic()->getCachePath() . '.last-sync';
+		if(!file_exists($syncFile)) {
+			file_put_contents($syncFile, '');
+		}
+		return $syncFile;
+	}
+
+	/**
+	 * Install
+	 *
+	 */
+	public function ___install() {
+		$this->wire()->database->exec(
+			'CREATE TABLE ' . self::DB_TABLE . ' (' .
+				'id int(10) unsigned NOT NULL AUTO_INCREMENT, ' .
+				'ts timestamp NOT NULL, ' .
+				'`data` TEXT, ' .
+				'PRIMARY KEY (id) ' .
+			") ENGINE={$this->wire()->config->dbEngine} DEFAULT CHARSET=utf8"
+		);
+	}
+
+	/**
+	 * Uninstall
+	 *
+	 */
+	public function uninstall() {
+		$this->wire()->database->exec('DROP TABLE ' . self::DB_TABLE);
+	}
+}
