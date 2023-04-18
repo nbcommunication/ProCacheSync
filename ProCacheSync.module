@@ -8,6 +8,9 @@
  * @copyright 2023 NB Communication Ltd
  * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
  *
+ * @property string $ids
+ * @property bool $update
+ *
  */
 
 class ProCacheSync extends WireData implements Module {
@@ -21,7 +24,7 @@ class ProCacheSync extends WireData implements Module {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProCache Sync',
-			'version' => 002,
+			'version' => 2,
 			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/ProCacheSync',
@@ -38,7 +41,7 @@ class ProCacheSync extends WireData implements Module {
 	/**
 	 * Cleared page IDs
 	 *
-	 * @var array
+	 * @var string
 	 *
 	 */
 	protected $ids = '';
@@ -46,7 +49,7 @@ class ProCacheSync extends WireData implements Module {
 	/**
 	 * Should the database be updated?
 	 *
-	 * @var array
+	 * @var bool
 	 *
 	 */
 	protected $update = true;
