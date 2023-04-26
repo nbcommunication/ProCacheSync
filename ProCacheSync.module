@@ -8,6 +8,7 @@
  * @copyright 2023 NB Communication Ltd
  * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
  *
+ * @property bool $cacheOn
  * @property string $ids
  * @property bool $update
  *
@@ -24,7 +25,7 @@ class ProCacheSync extends WireData implements Module {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProCache Sync',
-			'version' => 2,
+			'version' => 3,
 			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/ProCacheSync',
@@ -37,6 +38,14 @@ class ProCacheSync extends WireData implements Module {
 
 	const DB_TABLE = 'procache_sync';
 	const DELIMITER = '||';
+
+	/**
+	 * Is ProCache on?
+	 *
+	 * @var string
+	 *
+	 */
+	protected $cacheOn = false;
 
 	/**
 	 * Cleared page IDs
@@ -60,39 +69,43 @@ class ProCacheSync extends WireData implements Module {
 	 */
 	public function init() {
 
-		// Sync every minute
-		$this->addHook('LazyCron::every30Seconds', function(HookEvent $event) {
+		$procache = $this->wire()->procache;
 
-			$procache = $this->wire()->procache;
+		$this->cacheOn = $procache->cacheOn;
+		if($this->cacheOn) {
 
-			$syncFile = $this->syncFile();
+			// Sync every minute
+			$this->addHook('LazyCron::every30Seconds', function(HookEvent $event) use ($procache) {
 
-			$query = $this->wire()->database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
-			$query->bindValue(':now', date('Y-m-d H:i:s', filemtime($syncFile) ?: 0));
-			$query->execute();
+				$syncFile = $this->syncFile();
 
-			$this->update = false;
+				$query = $this->wire()->database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
+				$query->bindValue(':now', date('Y-m-d H:i:s', filemtime($syncFile) ?: 0));
+				$query->execute();
 
-			foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-				foreach(explode(self::DELIMITER, $row['data']) as $id) {
-					$id = (int) $id;
-					if($id) {
-						$page = $this->wire()->pages->get($id);
-						if($page->id) {
-							$procache->getStatic()->executeCacheClearBehaviors($page);
+				$this->update = false;
+
+				foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
+					foreach(explode(self::DELIMITER, $row['data']) as $id) {
+						$id = (int) $id;
+						if($id) {
+							$page = $this->wire()->pages->get($id);
+							if($page->id) {
+								$procache->getStatic()->executeCacheClearBehaviors($page);
+							}
+						} else {
+							$procache->clearAll();
+							break 2;
 						}
-					} else {
-						$procache->clearAll();
-						break 2;
 					}
 				}
-			}
 
-			touch($syncFile);
+				touch($syncFile);
 
-			$event->replace = true;
-			$event->return = '';
-		});
+				$event->replace = true;
+				$event->return = '';
+			});
+		}
 	}
 
 	/**
@@ -101,44 +114,47 @@ class ProCacheSync extends WireData implements Module {
 	 */
 	public function ready() {
 
-		// If cache clear behaviour is A, C or F
-		$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
-			$cleared = $event->return;
-			if(($cleared['children'] ?? 0) + ($cleared['family'] ?? 0)) {
-				$this->addId($event->arguments('page')->id);
-			} else if($cleared['site'] ?? 0) {
-				$this->addId();
-			}
-		});
+		if($this->cacheOn) {
 
-		// All hook
-		$this->addHook('ProCache::clearAll', function(HookEvent $event) {
-			$this->addId();
-		});
-
-		// Page hook
-		$this->addHook('ProCacheStaticClear::clearedPage', function(HookEvent $event) {
-			$this->addId($event->arguments('page')->id);
-		});
-
-		// When finished, updated the database if the cache cleared
-		$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
-			$delimiter = self::DELIMITER;
-			if($this->ids && substr($this->ids, strlen($delimiter) * -1) === $delimiter) {
-				$data = array_unique(explode($delimiter, trim($this->ids, $delimiter)));
-				if($this->update && count($data)) {
-					$query = $this->wire()->database->prepare(
-						'INSERT INTO ' . self::DB_TABLE .
-						' SET ' .
-							'ts=NOW(), ' .
-							'data=:data'
-					);
-					$query->bindValue(':data', implode($delimiter, $data));
-					$query->execute();
-					touch($this->syncFile());
+			// If cache clear behaviour is A, C or F
+			$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
+				$cleared = $event->return;
+				if(($cleared['children'] ?? 0) + ($cleared['family'] ?? 0)) {
+					$this->addId($event->arguments('page')->id);
+				} else if($cleared['site'] ?? 0) {
+					$this->addId();
 				}
-			}
-		});
+			});
+
+			// All hook
+			$this->addHook('ProCache::clearAll', function(HookEvent $event) {
+				$this->addId();
+			});
+
+			// Page hook
+			$this->addHook('ProCacheStaticClear::clearedPage', function(HookEvent $event) {
+				$this->addId($event->arguments('page')->id);
+			});
+
+			// When finished, updated the database if the cache cleared
+			$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
+				$delimiter = self::DELIMITER;
+				if($this->ids && substr($this->ids, strlen($delimiter) * -1) === $delimiter) {
+					$data = array_unique(explode($delimiter, trim($this->ids, $delimiter)));
+					if($this->update && count($data)) {
+						$query = $this->wire()->database->prepare(
+							'INSERT INTO ' . self::DB_TABLE .
+							' SET ' .
+								'ts=NOW(), ' .
+								'data=:data'
+						);
+						$query->bindValue(':data', implode($delimiter, $data));
+						$query->execute();
+						touch($this->syncFile());
+					}
+				}
+			});
+		}
 	}
 
 	/**
@@ -160,9 +176,10 @@ class ProCacheSync extends WireData implements Module {
 	 *
 	 */
 	protected function syncFile() {
+		$files = $this->wire()->files;
 		$syncFile = $this->wire()->procache->getStatic()->getCachePath() . '.last-sync';
-		if(!file_exists($syncFile)) {
-			file_put_contents($syncFile, '');
+		if(!$files->exists($syncFile)) {
+			$files->filePutContents($syncFile, '');
 		}
 		return $syncFile;
 	}
