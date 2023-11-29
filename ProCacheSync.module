@@ -10,7 +10,6 @@
  *
  * @property bool $cacheOn
  * @property string $ids
- * @property bool $update
  *
  */
 
@@ -25,19 +24,20 @@ class ProCacheSync extends WireData implements Module {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProCache Sync',
-			'version' => 3,
+			'version' => 4,
 			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/ProCacheSync',
 			'singular' => true,
 			'autoload' => true,
 			'icon' => 'refresh',
-			'requires' => 'ProcessWire>=3.0.210,PHP>=8.1.0,ProCache>=4.0.3,LazyCron',
+			'requires' => 'ProcessWire>=3.0.210,PHP>=8.1.0,ProCache>=4.0.3',
 		];
 	}
 
 	const DB_TABLE = 'procache_sync';
 	const DELIMITER = '||';
+	const DELIMITER_DATA = '::';
 
 	/**
 	 * Is ProCache on?
@@ -56,56 +56,12 @@ class ProCacheSync extends WireData implements Module {
 	protected $ids = '';
 
 	/**
-	 * Should the database be updated?
-	 *
-	 * @var bool
-	 *
-	 */
-	protected $update = true;
-
-	/**
 	 * Initialize the module
 	 *
 	 */
 	public function init() {
-
-		$procache = $this->wire()->procache;
-
-		$this->cacheOn = $procache->cacheOn;
-		if($this->cacheOn) {
-
-			// Sync every minute
-			$this->addHook('LazyCron::every30Seconds', function(HookEvent $event) use ($procache) {
-
-				$syncFile = $this->syncFile();
-
-				$query = $this->wire()->database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
-				$query->bindValue(':now', date('Y-m-d H:i:s', filemtime($syncFile) ?: 0));
-				$query->execute();
-
-				$this->update = false;
-
-				foreach($query->fetchAll(\PDO::FETCH_ASSOC) as $row) {
-					foreach(explode(self::DELIMITER, $row['data']) as $id) {
-						$id = (int) $id;
-						if($id) {
-							$page = $this->wire()->pages->get($id);
-							if($page->id) {
-								$procache->getStatic()->executeCacheClearBehaviors($page);
-							}
-						} else {
-							$procache->clearAll();
-							break 2;
-						}
-					}
-				}
-
-				touch($syncFile);
-
-				$event->replace = true;
-				$event->return = '';
-			});
-		}
+		$this->cacheOn = $this->wire()->procache->cacheOn;
+		$this->runSync();
 	}
 
 	/**
@@ -115,6 +71,11 @@ class ProCacheSync extends WireData implements Module {
 	public function ready() {
 
 		if($this->cacheOn) {
+
+			// All hook
+			$this->addHook('ProCache::clearAll', function(HookEvent $event) {
+				$this->addId();
+			});
 
 			// If cache clear behaviour is A, C or F
 			$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
@@ -126,31 +87,65 @@ class ProCacheSync extends WireData implements Module {
 				}
 			});
 
-			// All hook
-			$this->addHook('ProCache::clearAll', function(HookEvent $event) {
-				$this->addId();
-			});
-
 			// Page hook
 			$this->addHook('ProCacheStaticClear::clearedPage', function(HookEvent $event) {
-				$this->addId($event->arguments('page')->id);
+
+				$page = $event->arguments('page');
+				$id = $page->id;
+				$clearOptions = $event->arguments('options');
+
+				$options = [];
+				if(is_array($clearOptions)) {
+
+					// These additional values are not required
+					foreach([
+						'filesCleared',
+						'pathsCleared',
+						'pathsNotCleared',
+						'numRowsCleared',
+					] as $key) {
+						unset($clearOptions[$key]);
+					}
+
+					$defaults = array(
+						'getFiles' => false,
+						'language' => '', // clear only this language name
+						'urlSegmentStr' => '', // clear only matching this URL segment string, wildcards or regex OK
+						'urlSegments' => array(), // clear only those having any of these URL segments
+						'pageNum' => 0, // clear only this pageNum, true to clear all pageNum, false to clear no pageNum
+						'rmdir' => false, // remove directories rather than index files?
+						'languageID' => 0, // set automatically by clearPageInit when 'language' option is specified
+						'clearRoot' => null, // clear root index of page path, sans URL-segments, etc.?
+						'clearOnlyRoot' => false, // populated by clearPageInit() only (not user specified)
+						'flags' => -1, // clear only rows matching these flags or -1 to ignore
+						'page' => $page, // used by findCacheEntries() call
+					);
+
+					foreach($clearOptions as $key => $value) {
+						if($value !== ($defaults[$key] ?? '')) {
+							$options[$key] = $value;
+						}
+					}
+				}
+
+				// We need to check if any of the default options have changed
+				if(count($options)) {
+					$this->addId($id . self::DELIMITER_DATA . base64_encode(json_encode($options)));
+				} else {
+					$this->addId($id);
+				}
 			});
 
-			// When finished, updated the database if the cache cleared
+			// When finished, update the database if the cache cleared
 			$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
 				$delimiter = self::DELIMITER;
 				if($this->ids && substr($this->ids, strlen($delimiter) * -1) === $delimiter) {
 					$data = array_unique(explode($delimiter, trim($this->ids, $delimiter)));
-					if($this->update && count($data)) {
-						$query = $this->wire()->database->prepare(
-							'INSERT INTO ' . self::DB_TABLE .
-							' SET ' .
-								'ts=NOW(), ' .
-								'data=:data'
-						);
+					if(!file_exists($this->syncFile('run', false)) && count($data)) {
+						$this->runSync();
+						$query = $this->wire()->database->prepare('INSERT INTO ' . self::DB_TABLE . ' SET data=:data');
 						$query->bindValue(':data', implode($delimiter, $data));
 						$query->execute();
-						touch($this->syncFile());
 					}
 				}
 			});
@@ -158,9 +153,92 @@ class ProCacheSync extends WireData implements Module {
 	}
 
 	/**
+	 * Run sync
+	 *
+	 * @return int
+	 *
+	 */
+	public function runSync() {
+
+		if(!$this->cacheOn) {
+			return 0;
+		}
+
+		$procache = $this->wire()->procache;
+		$pages = $this->wire()->pages;
+
+		$syncFile = $this->syncFile();
+
+		$time = time();
+
+		// check if sync has already occurred within the last 30 seconds
+		if(is_file($syncFile)) {
+			if(filemtime($syncFile) + ProCache::MAINTENANCE_SECONDS > $time) return 0;
+		}
+
+		// Check if sync is already occurring under another request
+		$runFile = $this->syncFile('run', false);
+		if(is_file($runFile) && filemtime($runFile) > ($time - 30)) return 0;
+
+		// Create the run fule
+		$runFile = $this->syncFile('run');
+
+		$query = $this->wire()->database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
+		$query->bindValue(':now', date('Y-m-d H:i:s', filemtime($syncFile) ?: 0));
+		$query->execute();
+
+		$rows = $query->fetchAll(\PDO::FETCH_ASSOC);
+		$c = count($rows);
+		if($c) {
+
+			foreach($rows as $row) {
+				foreach(explode(self::DELIMITER, $row['data']) as $id) {
+					$parts = explode(self::DELIMITER_DATA, $id);
+					if(count($parts) === 2) {
+						$id = (int) $parts[0];
+						$options = json_decode(base64_decode($parts[1]), true);
+						if($id) {
+							$page = $pages->get($id);
+							if($page->id) {
+								$procache->clearPage($page, $options);
+							}
+						} else {
+							$procache->clearAll();
+							break 2;
+						}
+					} else {
+						$id = (int) $id;
+						if($id) {
+							$page = $pages->get($id);
+							if($page->id) {
+								$procache->getStatic()->executeCacheClearBehaviors($page);
+							}
+						} else {
+							$procache->clearAll();
+							break 2;
+						}
+					}
+				}
+			}
+
+			// Remove old sync records
+			$query = $this->wire()->database->prepare('DELETE FROM ' . self::DB_TABLE . ' WHERE ts<:old');
+			$query->bindValue(':old', date('Y-m-d H:i:s', strtotime('-1 day')));
+			$query->execute();
+		}
+
+		touch($syncFile);
+		if(is_file($runFile)) {
+			$this->wire()->files->unlink($runFile);
+		}
+
+		return $c;
+	}
+
+	/**
 	 * Add id
 	 *
-	 * @param int $id
+	 * @param int|string $id
 	 *
 	 */
 	protected function addId($id = 0) {
@@ -172,13 +250,15 @@ class ProCacheSync extends WireData implements Module {
 	 *
 	 * Create the sync file if it does not exist
 	 *
+	 * @param string $type
+	 * @param bool $create
 	 * @return string
 	 *
 	 */
-	protected function syncFile() {
+	protected function syncFile($type = 'last', $create = true) {
 		$files = $this->wire()->files;
-		$syncFile = $this->wire()->procache->getStatic()->getCachePath() . '.last-sync';
-		if(!$files->exists($syncFile)) {
+		$syncFile = $this->wire()->procache->getStatic()->getCachePath() . ".$type-sync";
+		if($create && !$files->exists($syncFile)) {
 			$files->filePutContents($syncFile, '');
 		}
 		return $syncFile;
@@ -192,7 +272,7 @@ class ProCacheSync extends WireData implements Module {
 		$this->wire()->database->exec(
 			'CREATE TABLE ' . self::DB_TABLE . ' (' .
 				'id int(10) unsigned NOT NULL AUTO_INCREMENT, ' .
-				'ts timestamp NOT NULL, ' .
+				'ts timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP, ' .
 				'`data` TEXT, ' .
 				'PRIMARY KEY (id) ' .
 			") ENGINE={$this->wire()->config->dbEngine} DEFAULT CHARSET=utf8"
