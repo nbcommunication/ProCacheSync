@@ -5,11 +5,10 @@
  *
  * #pw-summary Synchronises ProCache clearing across a multi-instance environment.
  *
- * @copyright 2023 NB Communication Ltd
+ * @copyright 2024 NB Communication Ltd
  * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
  *
  * @property bool $cacheOn
- * @property string $ids
  *
  */
 
@@ -24,7 +23,7 @@ class ProCacheSync extends WireData implements Module {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProCache Sync',
-			'version' => 4,
+			'version' => 5,
 			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/ProCacheSync',
@@ -36,8 +35,6 @@ class ProCacheSync extends WireData implements Module {
 	}
 
 	const DB_TABLE = 'procache_sync';
-	const DELIMITER = '||';
-	const DELIMITER_DATA = '::';
 
 	/**
 	 * Is ProCache on?
@@ -48,19 +45,12 @@ class ProCacheSync extends WireData implements Module {
 	protected $cacheOn = false;
 
 	/**
-	 * Cleared page IDs
-	 *
-	 * @var string
-	 *
-	 */
-	protected $ids = '';
-
-	/**
 	 * Initialize the module
 	 *
 	 */
 	public function init() {
 		$this->cacheOn = $this->wire()->procache->cacheOn;
+		$this->set('data', ['rows' => []]);
 		$this->runSync();
 	}
 
@@ -74,16 +64,16 @@ class ProCacheSync extends WireData implements Module {
 
 			// All hook
 			$this->addHook('ProCache::clearAll', function(HookEvent $event) {
-				$this->addId();
+				$this->addRow();
 			});
 
 			// If cache clear behaviour is A, C or F
 			$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
 				$cleared = $event->return;
 				if(($cleared['children'] ?? 0) + ($cleared['family'] ?? 0)) {
-					$this->addId($event->arguments('page')->id);
+					$this->addRow(['executeCacheClearBehaviors' => $event->arguments('page')->id]);
 				} else if($cleared['site'] ?? 0) {
-					$this->addId();
+					$this->addRow();
 				}
 			});
 
@@ -99,8 +89,6 @@ class ProCacheSync extends WireData implements Module {
 
 					// These additional values are not required
 					foreach([
-						'filesCleared',
-						'pathsCleared',
 						'pathsNotCleared',
 						'numRowsCleared',
 					] as $key) {
@@ -128,23 +116,22 @@ class ProCacheSync extends WireData implements Module {
 					}
 				}
 
-				// We need to check if any of the default options have changed
-				if(count($options)) {
-					$this->addId($id . self::DELIMITER_DATA . base64_encode(json_encode($options)));
-				} else {
-					$this->addId($id);
-				}
+				$this->addRow([
+					'clearPage' => [
+						'page' => $id,
+						'options' => $options,
+					]
+				]);
 			});
 
 			// When finished, update the database if the cache cleared
 			$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
-				$delimiter = self::DELIMITER;
-				if($this->ids && substr($this->ids, strlen($delimiter) * -1) === $delimiter) {
-					$data = array_unique(explode($delimiter, trim($this->ids, $delimiter)));
-					if(!file_exists($this->syncFile('run', false)) && count($data)) {
-						$this->runSync();
+				$rows = $this->get('rows');
+				if(count($rows) && !file_exists($this->syncFile('run', false))) {
+					$this->runSync();
+					foreach($rows as $row) {
 						$query = $this->wire()->database->prepare('INSERT INTO ' . self::DB_TABLE . ' SET data=:data');
-						$query->bindValue(':data', implode($delimiter, $data));
+						$query->bindValue(':data', json_encode($row));
 						$query->execute();
 					}
 				}
@@ -192,31 +179,74 @@ class ProCacheSync extends WireData implements Module {
 		if($c) {
 
 			foreach($rows as $row) {
-				foreach(explode(self::DELIMITER, $row['data']) as $id) {
-					$parts = explode(self::DELIMITER_DATA, $id);
-					if(count($parts) === 2) {
-						$id = (int) $parts[0];
-						$options = json_decode(base64_decode($parts[1]), true);
-						if($id) {
-							$page = $pages->get($id);
-							if($page->id) {
-								$procache->clearPage($page, $options);
-							}
-						} else {
-							$procache->clearAll();
-							break 2;
+
+				$data = json_decode($row['data'], 1);
+				if(!is_array($data)) continue;
+
+				foreach($data as $method => $arguments) {
+
+					if($method === 'clearAll') {
+						$procache->clearAll();
+						continue;
+					}
+
+					if($method === 'executeCacheClearBehaviors') {
+						$page = $pages->get($arguments);
+						if($page->id) {
+							$procache->getStatic()->executeCacheClearBehaviors($page);
 						}
-					} else {
-						$id = (int) $id;
-						if($id) {
-							$page = $pages->get($id);
-							if($page->id) {
-								$procache->getStatic()->executeCacheClearBehaviors($page);
+						continue;
+					}
+
+					if($method === 'clearPage') {
+
+						$id = $arguments['page'];
+						$options = $arguments['options'] ?? [];
+
+						$clearFiles = [];
+						if(isset($options['filesCleared'])) {
+							if(is_array($options['filesCleared'])) {
+								$clearFiles = $options['filesCleared'];
 							}
-						} else {
-							$procache->clearAll();
-							break 2;
+							unset($options['filesCleared']);
 						}
+
+						$clearPaths = [];
+						if(isset($options['pathsCleared'])) {
+							if(is_array($options['pathsCleared'])) {
+								$clearPaths = $options['pathsCleared'];
+							}
+							unset($options['pathsCleared']);
+						}
+
+						$page = $pages->get($id);
+						if($page->id) {
+							$procache->clearPage($page, $options);
+						}
+
+						// Remove files
+						if(count($clearFiles)) {
+							$rootPath = rtrim($this->wire()->config->paths->root, '/');
+							foreach($clearFiles as $path) {
+								$file = $rootPath . $path;
+								if(file_exists($file)) {
+									$this->files()->unlink($file);
+								}
+							}
+						}
+
+						// Remove paths
+						if(count($clearPaths)) {
+							$cachePath = rtrim($procache->getStatic()->getCachePath(), '/');
+							foreach($clearPaths as $path) {
+								$dir = $cachePath . $path;
+								if(is_dir($dir)) {
+									$this->files()->rmdir2($dir, true);
+								}
+							}
+						}
+
+						continue;
 					}
 				}
 			}
@@ -236,13 +266,18 @@ class ProCacheSync extends WireData implements Module {
 	}
 
 	/**
-	 * Add id
+	 * Add a row to the database record
 	 *
-	 * @param int|string $id
+	 * @param array $row
 	 *
 	 */
-	protected function addId($id = 0) {
-		$this->ids .= $id . self::DELIMITER;
+	protected function addRow(array $row = []) {
+		if(empty($row)) {
+			$row = ['clearAll' => true];
+		}
+		$rows = $this->get('rows');
+		$rows[] = $row;
+		$this->set('data', ['rows' => $rows]);
 	}
 
 	/**
