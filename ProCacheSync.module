@@ -9,6 +9,7 @@
  * @license Mozilla Public License v2.0 http://mozilla.org/MPL/2.0/
  *
  * @property bool $cacheOn
+ * @property string $id
  *
  */
 
@@ -23,7 +24,7 @@ class ProCacheSync extends WireData implements Module {
 	public static function getModuleInfo() {
 		return [
 			'title' => 'ProCache Sync',
-			'version' => 5,
+			'version' => 6,
 			'summary' => 'Synchronises ProCache clearing across a multi-instance environment.',
 			'author' => 'nbcommunication',
 			'href' => 'https://github.com/nbcommunication/ProCacheSync',
@@ -39,10 +40,18 @@ class ProCacheSync extends WireData implements Module {
 	/**
 	 * Is ProCache on?
 	 *
-	 * @var string
+	 * @var bool
 	 *
 	 */
 	protected $cacheOn = false;
+
+	/**
+	 * The instance ID
+	 *
+	 * @var string
+	 *
+	 */
+	protected $id = '';
 
 	/**
 	 * Initialize the module
@@ -50,8 +59,7 @@ class ProCacheSync extends WireData implements Module {
 	 */
 	public function init() {
 		$this->cacheOn = $this->wire()->procache->cacheOn;
-		$this->set('data', ['rows' => []]);
-		$this->runSync();
+		$this->set('data', ['cleared' => []]);
 	}
 
 	/**
@@ -62,18 +70,22 @@ class ProCacheSync extends WireData implements Module {
 
 		if($this->cacheOn) {
 
+			$this->runSync();
+
 			// All hook
 			$this->addHook('ProCache::clearAll', function(HookEvent $event) {
-				$this->addRow();
+				$this->addCleared();
 			});
 
 			// If cache clear behaviour is A, C or F
 			$this->addHookAfter('ProCacheStaticBehaviors::executeCacheClearBehaviors', function(HookEvent $event) {
 				$cleared = $event->return;
 				if(($cleared['children'] ?? 0) + ($cleared['family'] ?? 0)) {
-					$this->addRow(['executeCacheClearBehaviors' => $event->arguments('page')->id]);
+					$this->addCleared('executeCacheClearBehaviors', [
+						'page' => $event->arguments('page')->id
+					]);
 				} else if($cleared['site'] ?? 0) {
-					$this->addRow();
+					$this->addCleared();
 				}
 			});
 
@@ -116,24 +128,22 @@ class ProCacheSync extends WireData implements Module {
 					}
 				}
 
-				$this->addRow([
-					'clearPage' => [
-						'page' => $id,
-						'options' => $options,
-					]
+				$this->addCleared('clearPage', [
+					'page' => $id,
+					'options' => $options,
 				]);
 			});
 
 			// When finished, update the database if the cache cleared
 			$this->addHookAfter('ProcessPageView::finished', function(HookEvent $event) {
-				$rows = $this->get('rows');
-				if(count($rows) && !file_exists($this->syncFile('run', false))) {
-					$this->runSync();
-					foreach($rows as $row) {
-						$query = $this->wire()->database->prepare('INSERT INTO ' . self::DB_TABLE . ' SET data=:data');
-						$query->bindValue(':data', json_encode($row));
-						$query->execute();
-					}
+				$cleared = $this->get('cleared');
+				if(count($cleared)) {
+					$query = $this->wire()->database->prepare('INSERT INTO ' . self::DB_TABLE . ' SET data=:data');
+					$query->bindValue(':data', json_encode([
+						'id' => $this->id,
+						'cleared' => $cleared,
+					]));
+					$query->execute();
 				}
 			});
 		}
@@ -142,15 +152,17 @@ class ProCacheSync extends WireData implements Module {
 	/**
 	 * Run sync
 	 *
-	 * @return int
+	 * @return array
 	 *
 	 */
-	public function runSync() {
+	public function ___runSync() {
 
 		if(!$this->cacheOn) {
-			return 0;
+			return [];
 		}
 
+		$database = $this->wire()->database;
+		$files = $this->wire()->files;
 		$procache = $this->wire()->procache;
 		$pages = $this->wire()->pages;
 
@@ -159,125 +171,134 @@ class ProCacheSync extends WireData implements Module {
 		$time = time();
 
 		// check if sync has already occurred within the last 30 seconds
-		if(is_file($syncFile)) {
-			if(filemtime($syncFile) + ProCache::MAINTENANCE_SECONDS > $time) return 0;
+		if($files->exists($syncFile)) {
+			if(filemtime($syncFile) + ProCache::MAINTENANCE_SECONDS > $time) {
+				return [];
+			}
 		}
 
 		// Check if sync is already occurring under another request
 		$runFile = $this->syncFile('run', false);
-		if(is_file($runFile) && filemtime($runFile) > ($time - 30)) return 0;
+		if($files->exists($runFile) && filemtime($runFile) > ($time - 30)) {
+			return [];
+		}
 
-		// Create the run fule
+		// Create the run file
 		$runFile = $this->syncFile('run');
 
-		$query = $this->wire()->database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
+		$query = $database->prepare('SELECT data FROM ' . self::DB_TABLE . ' WHERE ts>:now');
 		$query->bindValue(':now', date('Y-m-d H:i:s', filemtime($syncFile) ?: 0));
 		$query->execute();
 
 		$rows = $query->fetchAll(\PDO::FETCH_ASSOC);
-		$c = count($rows);
-		if($c) {
+		$cleared = [];
+		if(count($rows)) {
 
 			foreach($rows as $row) {
 
-				$data = json_decode($row['data'], 1);
-				if(!is_array($data)) continue;
+				$clearData = json_decode($row['data'], 1);
+				if(!is_array($clearData) || !isset($clearData['id']) || !isset($clearData['cleared'])) continue;
+				if($clearData['id'] === $this->id) continue;
 
-				foreach($data as $method => $arguments) {
+				foreach($clearData['cleared'] as $item) {
 
-					if($method === 'clearAll') {
-						$procache->clearAll();
-						continue;
-					}
+					$cleared[] = $item;
 
-					if($method === 'executeCacheClearBehaviors') {
-						$page = $pages->get($arguments);
-						if($page->id) {
-							$procache->getStatic()->executeCacheClearBehaviors($page);
-						}
-						continue;
-					}
+					switch($item['method']) {
+						case 'clearAll':
 
-					if($method === 'clearPage') {
+							$procache->clearAll();
 
-						$id = $arguments['page'];
-						$options = $arguments['options'] ?? [];
+							break;
+						case 'executeCacheClearBehaviors':
 
-						$clearFiles = [];
-						if(isset($options['filesCleared'])) {
-							if(is_array($options['filesCleared'])) {
-								$clearFiles = $options['filesCleared'];
+							$page = $pages->get($item['data']['page'] ?? 0);
+							if($page->id) {
+								$procache->getStatic()->executeCacheClearBehaviors($page);
 							}
-							unset($options['filesCleared']);
-						}
 
-						$clearPaths = [];
-						if(isset($options['pathsCleared'])) {
-							if(is_array($options['pathsCleared'])) {
-								$clearPaths = $options['pathsCleared'];
+							break;
+						case 'clearPage':
+
+							$id = $item['data']['page'] ?? 0;
+							$options = $item['data']['options'] ?? [];
+
+							$clearFiles = [];
+							if(isset($options['filesCleared'])) {
+								if(is_array($options['filesCleared'])) {
+									$clearFiles = $options['filesCleared'];
+								}
+								unset($options['filesCleared']);
 							}
-							unset($options['pathsCleared']);
-						}
 
-						$page = $pages->get($id);
-						if($page->id) {
-							$procache->clearPage($page, $options);
-						}
+							$clearPaths = [];
+							if(isset($options['pathsCleared'])) {
+								if(is_array($options['pathsCleared'])) {
+									$clearPaths = $options['pathsCleared'];
+								}
+								unset($options['pathsCleared']);
+							}
 
-						// Remove files
-						if(count($clearFiles)) {
-							$rootPath = rtrim($this->wire()->config->paths->root, '/');
-							foreach($clearFiles as $path) {
-								$file = $rootPath . $path;
-								if(file_exists($file)) {
-									$this->files()->unlink($file);
+							$page = $pages->get($id);
+							if($page->id) {
+								$procache->clearPage($page, $options);
+							}
+
+							// Remove files
+							if(count($clearFiles)) {
+								$rootPath = rtrim($this->wire()->config->paths->root, '/');
+								foreach($clearFiles as $path) {
+									$file = $rootPath . $path;
+									if(file_exists($file)) {
+										$files->unlink($file);
+									}
 								}
 							}
-						}
 
-						// Remove paths
-						if(count($clearPaths)) {
-							$cachePath = rtrim($procache->getStatic()->getCachePath(), '/');
-							foreach($clearPaths as $path) {
-								$dir = $cachePath . $path;
-								if(is_dir($dir)) {
-									$this->files()->rmdir2($dir, true);
+							// Remove paths
+							if(count($clearPaths)) {
+								$cachePath = rtrim($procache->getStatic()->getCachePath(), '/');
+								foreach($clearPaths as $path) {
+									$dir = $cachePath . $path;
+									if(is_dir($dir)) {
+										$files->rmdir($dir, true);
+									}
 								}
 							}
-						}
 
-						continue;
+							break;
 					}
 				}
 			}
 
 			// Remove old sync records
-			$query = $this->wire()->database->prepare('DELETE FROM ' . self::DB_TABLE . ' WHERE ts<:old');
+			$query = $database->prepare('DELETE FROM ' . self::DB_TABLE . ' WHERE ts<:old');
 			$query->bindValue(':old', date('Y-m-d H:i:s', strtotime('-1 day')));
 			$query->execute();
 		}
 
 		touch($syncFile);
-		if(is_file($runFile)) {
-			$this->wire()->files->unlink($runFile);
+		if($files->exists($runFile)) {
+			$files->unlink($runFile);
 		}
 
-		return $c;
+		return $cleared;
 	}
 
 	/**
-	 * Add a row to the database record
+	 * Add clear data
 	 *
-	 * @param array $row
+	 * @param string $method
+	 * @param array $data
 	 *
 	 */
-	protected function addRow(array $row = []) {
-		if(empty($row)) {
-			$row = ['clearAll' => true];
-		}
-		$rows = $this->get('rows');
-		$rows[] = $row;
-		$this->set('data', ['rows' => $rows]);
+	protected function addCleared($method = 'clearAll', array $data = []) {
+		$cleared = $this->get('cleared');
+		$cleared[] = [
+			'method' => $method,
+			'data' => $data,
+		];
+		$this->set('data', ['cleared' => $cleared]);
 	}
 
 	/**
@@ -291,11 +312,24 @@ class ProCacheSync extends WireData implements Module {
 	 *
 	 */
 	protected function syncFile($type = 'last', $create = true) {
+
 		$files = $this->wire()->files;
+
 		$syncFile = $this->wire()->procache->getStatic()->getCachePath() . ".$type-sync";
-		if($create && !$files->exists($syncFile)) {
-			$files->filePutContents($syncFile, '');
+
+		if($type === 'last' && empty($this->id)) {
+			if($files->exists($syncFile)) {
+				$this->id = $files->fileGetContents($syncFile);
+			}
+			if(empty($this->id)) {
+				$this->id = $this->wire(new WireRandom())->alphanumeric(32);
+			}
 		}
+
+		if($create && !$files->exists($syncFile)) {
+			$files->filePutContents($syncFile, $this->id);
+		}
+
 		return $syncFile;
 	}
 
